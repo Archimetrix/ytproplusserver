@@ -1,0 +1,15 @@
+{
+  "name": "ytpro-room-server",
+  "version": "1.0.0",
+  "description": "WebSocket relay server for YouTube Pro+ watch-party rooms",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
