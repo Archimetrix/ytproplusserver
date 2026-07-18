@@ -26,10 +26,14 @@ const HOST_GRACE_MS = 90 * 1000;          // how long a room survives after the 
 // A guest's socket can drop for reasons that have nothing to do with them
 // actually leaving — most commonly, the host changes video and the guest's
 // tab falls back to a hard page reload instead of YouTube's in-page nav,
-// which kills the content script + WebSocket for a second. Give a guest
-// this long to silently resume their same identity (via a guestToken)
-// before we announce them as having left the room.
-const GUEST_RECONNECT_GRACE_MS = 10 * 1000;
+// which kills the content script + WebSocket for a second, OR the relay
+// itself is a Render free-tier instance cold-starting (30-50s) exactly like
+// the scenario HOST_GRACE_MS above already accounts for. Guests hit that
+// same cold start when their socket tries to reconnect, so their grace
+// period needs to be just as forgiving — 10s was nowhere near enough and
+// was the main reason a reconnecting guest kept getting treated as a brand
+// new user (old identity expired before the reconnect attempt landed).
+const GUEST_RECONNECT_GRACE_MS = 90 * 1000;
 
 // ── Chat config ─────────────────────────────────────────────────────────
 // Chat is 100% in-memory and lives only as long as the Room object does.
