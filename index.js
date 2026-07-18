@@ -127,6 +127,11 @@ class Room {
   constructor(code, hostId, hostWs, hostToken) {
     this.code = code;
     this.hostId = hostId;
+    // hostId changes every time the host reconnects/reclaims (it's tied to
+    // the live socket). hostPublicId never changes for the life of the room,
+    // so the host's own past chat bubbles don't flip from "mine" to
+    // "someone else's" after they reconnect.
+    this.hostPublicId = hostId;
     this.hostToken = hostToken;
     this.hostMissing = false;
     this.graceTimer = null;
@@ -135,14 +140,36 @@ class Room {
     this.lastState = null; // { videoId, time, playing, updatedAt }
     this.names = new Map(); // clientId -> display name (in-memory only)
     this.messages = []; // in-memory chat buffer, wiped when the Room is deleted
-    // token -> { name, clientId, leaveTimer }. Lets a guest whose socket
-    // drops (e.g. hard reload on video change) silently resume the same
-    // identity instead of showing up as "left" then "joined" in chat.
+    // token -> { name, publicId, clientId, leaveTimer }. Lets a guest whose
+    // socket drops (e.g. hard reload on video change) silently resume the
+    // same identity instead of showing up as "left" then "joined" in chat.
+    // publicId is stable across reconnects (for "mine" chat styling);
+    // clientId tracks the current live socket and DOES change each reconnect.
     this.guestIdentities = new Map();
     this.touch();
   }
   touch() {
     this.lastUsed = Date.now();
+  }
+  // The id used to *display*/attribute a message, stable across that
+  // person's reconnects — as opposed to ws.clientId, which is a fresh
+  // random value every time the underlying socket reconnects.
+  publicIdFor(ws) {
+    if (ws.isHost && this.hostId === ws.clientId) return this.hostPublicId;
+    const identity = ws.guestToken ? this.guestIdentities.get(ws.guestToken) : null;
+    return identity ? identity.publicId : ws.clientId;
+  }
+  // Case/whitespace-insensitive name collision check, so "Sneha" and
+  // " sneha " are treated as the same name. excludeClientId lets a client
+  // check against everyone EXCEPT their own current entry (e.g. keeping
+  // their own name during a rename).
+  isNameTaken(name, excludeClientId) {
+    const wanted = name.trim().toLowerCase();
+    for (const [id, existingName] of this.names) {
+      if (id === excludeClientId) continue;
+      if (existingName.trim().toLowerCase() === wanted) return true;
+    }
+    return false;
   }
   broadcast(fromId, payload) {
     const msg = JSON.stringify(payload);
@@ -295,7 +322,17 @@ wss.on('connection', (ws, req) => {
         room.clients.delete(room.hostId);
         room.hostId = ws.clientId;
         room.clients.set(ws.clientId, ws);
-        room.names.set(ws.clientId, sanitizeName(msg.name, oldHostName || 'Host'));
+
+        let hostName = oldHostName || 'Host';
+        if (msg.name) {
+          const requestedName = sanitizeName(msg.name, hostName);
+          // Keep the old name if the requested one collides with someone
+          // else already in the room, rather than failing the reconnect.
+          if (requestedName.toLowerCase() === hostName.toLowerCase() || !room.isNameTaken(requestedName, null)) {
+            hostName = requestedName;
+          }
+        }
+        room.names.set(ws.clientId, hostName);
         room.clearGrace();
         room.touch();
         ws.roomCode = code;
@@ -304,7 +341,7 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({
           type: 'room_reclaimed',
           code,
-          clientId: ws.clientId,
+          clientId: room.hostPublicId, // stable across reconnects — keeps "mine" chat styling correct
           hostToken: room.hostToken,
           memberCount: room.clients.size,
           state: room.lastState,
@@ -340,7 +377,14 @@ wss.on('connection', (ws, req) => {
         if (existing) {
           room.clients.set(ws.clientId, ws);
           existing.clientId = ws.clientId;
-          if (msg.name) existing.name = sanitizeName(msg.name, existing.name);
+          if (msg.name) {
+            const requestedName = sanitizeName(msg.name, existing.name);
+            // Keep the old name if the new one collides with someone else —
+            // don't fail a reconnect over a rename conflict.
+            if (requestedName.toLowerCase() === existing.name.toLowerCase() || !room.isNameTaken(requestedName, null)) {
+              existing.name = requestedName;
+            }
+          }
           room.names.set(ws.clientId, existing.name);
           room.touch();
           ws.roomCode = code;
@@ -349,7 +393,7 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({
             type: 'room_joined',
             code,
-            clientId: ws.clientId,
+            clientId: existing.publicId, // stable across reconnects — keeps "mine" chat styling correct
             guestToken: rejoinToken,
             memberCount: room.clients.size,
             hostPaused: room.hostMissing,
@@ -367,8 +411,12 @@ wss.on('connection', (ws, req) => {
         }
 
         const guestName = sanitizeName(msg.name, 'Guest');
+        if (room.isNameTaken(guestName, null)) {
+          ws.send(JSON.stringify({ type: 'error', message: `"${guestName}" is already in use in this room — please choose a different name.` }));
+          return;
+        }
         const guestToken = makeGuestToken();
-        room.guestIdentities.set(guestToken, { name: guestName, clientId: ws.clientId, leaveTimer: null });
+        room.guestIdentities.set(guestToken, { name: guestName, publicId: ws.clientId, clientId: ws.clientId, leaveTimer: null });
         room.clients.set(ws.clientId, ws);
         room.names.set(ws.clientId, guestName);
         room.touch();
@@ -378,7 +426,7 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({
           type: 'room_joined',
           code,
-          clientId: ws.clientId,
+          clientId: ws.clientId, // == publicId at this point, since it's a brand new identity
           guestToken,
           memberCount: room.clients.size,
           hostPaused: room.hostMissing, // let the guest UI show "waiting for host to reconnect"
@@ -420,7 +468,7 @@ wss.on('connection', (ws, req) => {
         room.touch();
         const entry = {
           id: makeMessageId(),
-          clientId: ws.clientId,
+          clientId: room.publicIdFor(ws), // stable across reconnects, unlike ws.clientId
           name: room.nameFor(ws.clientId),
           isHost: ws.isHost && room.hostId === ws.clientId,
           text,
