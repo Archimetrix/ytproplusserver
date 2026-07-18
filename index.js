@@ -525,12 +525,18 @@ function handleExplicitLeave(ws) {
       rooms.delete(room.code);
     } else {
       const name = room.nameFor(ws.clientId);
+      // Capture the STABLE id before we tear down the identity below — every
+      // other message this person ever sent (joins, chats) was tagged with
+      // this publicId, not the raw per-connection ws.clientId. Tagging the
+      // leave note with the wrong one meant clients could never match it
+      // back up to remove that person's avatar — it just lingered forever.
+      const stableId = room.publicIdFor(ws);
       room.clients.delete(ws.clientId);
       room.names.delete(ws.clientId);
       if (ws.guestToken) room.guestIdentities.delete(ws.guestToken);
       room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
       const leaveNote = {
-        id: makeMessageId(), system: true, clientId: ws.clientId,
+        id: makeMessageId(), system: true, clientId: stableId,
         name, text: `${name} left the room`, ts: Date.now()
       };
       room.addChatMessage(leaveNote);
@@ -577,6 +583,7 @@ function cleanupClient(ws) {
       // resume silently. Member count also stays as-is in the meantime so
       // it doesn't flicker down and back up.
       const droppedClientId = ws.clientId;
+      const stableId = identity.publicId; // stable across reconnects — same id used in every join/chat note for this person
       identity.leaveTimer = setTimeout(() => {
         // If a new connection already reclaimed this token, identity.clientId
         // will have moved on — in that case this timer is a no-op.
@@ -584,7 +591,7 @@ function cleanupClient(ws) {
         room.guestIdentities.delete(ws.guestToken);
         room.broadcast(null, { type: 'member_count', count: room.clients.size });
         const leaveNote = {
-          id: makeMessageId(), system: true, clientId: droppedClientId,
+          id: makeMessageId(), system: true, clientId: stableId,
           name: identity.name, text: `${identity.name} left the room`, ts: Date.now()
         };
         room.addChatMessage(leaveNote);
@@ -594,7 +601,7 @@ function cleanupClient(ws) {
       room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
       if (wasPresent) {
         const leaveNote = {
-          id: makeMessageId(), system: true, clientId: ws.clientId,
+          id: makeMessageId(), system: true, clientId: room.publicIdFor(ws),
           name, text: `${name} left the room`, ts: Date.now()
         };
         room.addChatMessage(leaveNote);
