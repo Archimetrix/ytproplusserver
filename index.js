@@ -23,6 +23,14 @@ const HOST_GRACE_MS = 90 * 1000;          // how long a room survives after the 
 // (90s comfortably covers a Render free-tier cold start, which can take
 // 30-50s, plus normal client reconnect backoff.)
 
+// A guest's socket can drop for reasons that have nothing to do with them
+// actually leaving — most commonly, the host changes video and the guest's
+// tab falls back to a hard page reload instead of YouTube's in-page nav,
+// which kills the content script + WebSocket for a second. Give a guest
+// this long to silently resume their same identity (via a guestToken)
+// before we announce them as having left the room.
+const GUEST_RECONNECT_GRACE_MS = 10 * 1000;
+
 // ── Chat config ─────────────────────────────────────────────────────────
 // Chat is 100% in-memory and lives only as long as the Room object does.
 // The moment a room is deleted (host ends it, grace period expires, TTL
@@ -90,6 +98,10 @@ function makeMessageId() {
   return crypto.randomBytes(6).toString('hex');
 }
 
+function makeGuestToken() {
+  return crypto.randomBytes(12).toString('hex');
+}
+
 /** @type {Map<string, Room>} */
 const rooms = new Map();
 
@@ -123,6 +135,10 @@ class Room {
     this.lastState = null; // { videoId, time, playing, updatedAt }
     this.names = new Map(); // clientId -> display name (in-memory only)
     this.messages = []; // in-memory chat buffer, wiped when the Room is deleted
+    // token -> { name, clientId, leaveTimer }. Lets a guest whose socket
+    // drops (e.g. hard reload on video change) silently resume the same
+    // identity instead of showing up as "left" then "joined" in chat.
+    this.guestIdentities = new Map();
     this.touch();
   }
   touch() {
@@ -150,6 +166,15 @@ class Room {
   }
   nameFor(clientId) {
     return this.names.get(clientId) || 'Guest';
+  }
+  // Called whenever the room itself is being deleted, so we don't leave
+  // dangling timers around waiting to fire "left the room" into a room
+  // that no longer exists.
+  clearAllGuestTimers() {
+    for (const identity of this.guestIdentities.values()) {
+      if (identity.leaveTimer) clearTimeout(identity.leaveTimer);
+    }
+    this.guestIdentities.clear();
   }
   clearGrace() {
     if (this.graceTimer) {
@@ -304,20 +329,57 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({ type: 'error', message: 'Room not found. Check the code and try again.' }));
           return;
         }
+
+        // If this connection is presenting a token for an identity we
+        // already know about, treat it as the SAME guest resuming — no
+        // capacity check needed (they already hold a seat) and no
+        // join/leave chat spam.
+        const rejoinToken = typeof msg.rejoinToken === 'string' ? msg.rejoinToken : null;
+        const existing = rejoinToken ? room.guestIdentities.get(rejoinToken) : null;
+
+        if (existing) {
+          room.clients.set(ws.clientId, ws);
+          existing.clientId = ws.clientId;
+          if (msg.name) existing.name = sanitizeName(msg.name, existing.name);
+          room.names.set(ws.clientId, existing.name);
+          room.touch();
+          ws.roomCode = code;
+          ws.isHost = false;
+          ws.guestToken = rejoinToken;
+          ws.send(JSON.stringify({
+            type: 'room_joined',
+            code,
+            clientId: ws.clientId,
+            guestToken: rejoinToken,
+            memberCount: room.clients.size,
+            hostPaused: room.hostMissing,
+            state: room.lastState,
+            messages: room.messages
+          }));
+          // Member count is unchanged from the room's perspective (this
+          // person never really left), so nothing to broadcast here.
+          break;
+        }
+
         if (room.clients.size >= MAX_CLIENTS_PER_ROOM) {
           ws.send(JSON.stringify({ type: 'error', message: 'This room is full.' }));
           return;
         }
-        room.clients.set(ws.clientId, ws);
+
         const guestName = sanitizeName(msg.name, 'Guest');
+        const guestToken = makeGuestToken();
+        room.guestIdentities.set(guestToken, { name: guestName, clientId: ws.clientId, leaveTimer: null });
+        room.clients.set(ws.clientId, ws);
         room.names.set(ws.clientId, guestName);
         room.touch();
         ws.roomCode = code;
         ws.isHost = false;
+        ws.guestToken = guestToken;
         ws.send(JSON.stringify({
           type: 'room_joined',
           code,
           clientId: ws.clientId,
+          guestToken,
           memberCount: room.clients.size,
           hostPaused: room.hostMissing, // let the guest UI show "waiting for host to reconnect"
           state: room.lastState, // so the new viewer can jump to the current spot
@@ -389,6 +451,7 @@ function handleExplicitLeave(ws) {
   if (room) {
     if (ws.isHost && room.hostId === ws.clientId) {
       room.clearGrace();
+      room.clearAllGuestTimers();
       // Host ending the room deletes it entirely — messages, names, state,
       // everything in this Room object is discarded right here.
       room.broadcast(ws.clientId, { type: 'room_closed' });
@@ -397,6 +460,7 @@ function handleExplicitLeave(ws) {
       const name = room.nameFor(ws.clientId);
       room.clients.delete(ws.clientId);
       room.names.delete(ws.clientId);
+      if (ws.guestToken) room.guestIdentities.delete(ws.guestToken);
       room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
       const leaveNote = {
         id: makeMessageId(), system: true, clientId: ws.clientId,
@@ -428,6 +492,7 @@ function cleanupClient(ws) {
         // Grace period expired without the host reclaiming — the room (and
         // every chat message in it) is deleted here.
         room.broadcast(null, { type: 'room_closed' });
+        room.clearAllGuestTimers();
         rooms.delete(room.code);
       }
     }, HOST_GRACE_MS);
@@ -436,7 +501,29 @@ function cleanupClient(ws) {
     const wasPresent = room.clients.has(ws.clientId);
     room.clients.delete(ws.clientId);
     room.names.delete(ws.clientId);
-    if (room.clients.size > 0) {
+
+    const identity = ws.guestToken ? room.guestIdentities.get(ws.guestToken) : null;
+    if (identity) {
+      // Don't announce anything yet — this socket dropping might just be a
+      // hard page reload triggered by a video change. Give them
+      // GUEST_RECONNECT_GRACE_MS to reconnect with the same guestToken and
+      // resume silently. Member count also stays as-is in the meantime so
+      // it doesn't flicker down and back up.
+      const droppedClientId = ws.clientId;
+      identity.leaveTimer = setTimeout(() => {
+        // If a new connection already reclaimed this token, identity.clientId
+        // will have moved on — in that case this timer is a no-op.
+        if (identity.clientId !== droppedClientId) return;
+        room.guestIdentities.delete(ws.guestToken);
+        room.broadcast(null, { type: 'member_count', count: room.clients.size });
+        const leaveNote = {
+          id: makeMessageId(), system: true, clientId: droppedClientId,
+          name: identity.name, text: `${identity.name} left the room`, ts: Date.now()
+        };
+        room.addChatMessage(leaveNote);
+        room.broadcast(null, { type: 'chat', message: leaveNote });
+      }, GUEST_RECONNECT_GRACE_MS);
+    } else if (room.clients.size > 0) {
       room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
       if (wasPresent) {
         const leaveNote = {
@@ -466,6 +553,7 @@ const sweeper = setInterval(() => {
   for (const [code, room] of rooms) {
     if (now - room.lastUsed > ROOM_TTL_MS) {
       room.clearGrace();
+      room.clearAllGuestTimers();
       rooms.delete(code);
     }
   }
