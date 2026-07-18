@@ -379,6 +379,17 @@ wss.on('connection', (ws, req) => {
         const existing = rejoinToken ? room.guestIdentities.get(rejoinToken) : null;
 
         if (existing) {
+          // The socket that dropped is dead, but its OLD clientId is still
+          // sitting in room.clients/room.names pointing at that closed
+          // socket — if we don't remove it here, every reconnect leaves
+          // one more ghost entry behind and room.clients.size (which
+          // memberCount and the header avatar count are read from) creeps
+          // up forever even though the real number of people never changed.
+          const staleClientId = existing.clientId;
+          if (staleClientId && staleClientId !== ws.clientId) {
+            room.clients.delete(staleClientId);
+            room.names.delete(staleClientId);
+          }
           room.clients.set(ws.clientId, ws);
           existing.clientId = ws.clientId;
           if (msg.name) {
@@ -404,8 +415,12 @@ wss.on('connection', (ws, req) => {
             state: room.lastState,
             messages: room.messages
           }));
-          // Member count is unchanged from the room's perspective (this
-          // person never really left), so nothing to broadcast here.
+          // The count itself doesn't change from the room's perspective
+          // (this person never really left) but the corrected size above
+          // may differ from what others were last told, if ghost entries
+          // had already inflated it — so re-broadcast to keep every
+          // client's header count accurate.
+          room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
           break;
         }
 
