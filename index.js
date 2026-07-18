@@ -4,6 +4,11 @@
 // Plain WebSocket relay. Rooms live in memory only (no database).
 // The server never looks at video content — it just forwards small JSON
 // messages from the host to everyone else in the same room.
+//
+// v2: host connections can drop and come back (flaky wifi, Render free-tier
+// cold starts, laptop sleep) without killing the room. A dropped host gets
+// a grace period to "reclaim" their room with the same code instead of the
+// room being deleted the instant the socket closes.
 // ─────────────────────────────────────────────────────────────────────────
 
 const http = require('http');
@@ -12,7 +17,10 @@ const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I ambiguity
-const ROOM_TTL_MS = 6 * 60 * 60 * 1000; // auto-clean rooms idle > 6h
+const ROOM_TTL_MS = 6 * 60 * 60 * 1000;   // auto-clean rooms idle > 6h
+const HOST_GRACE_MS = 90 * 1000;          // how long a room survives after the host's socket drops
+// (90s comfortably covers a Render free-tier cold start, which can take
+// 30-50s, plus normal client reconnect backoff.)
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();
@@ -31,10 +39,17 @@ function makeClientId() {
   return crypto.randomBytes(8).toString('hex');
 }
 
+function makeHostToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
 class Room {
-  constructor(code, hostId, hostWs) {
+  constructor(code, hostId, hostWs, hostToken) {
     this.code = code;
     this.hostId = hostId;
+    this.hostToken = hostToken;
+    this.hostMissing = false;
+    this.graceTimer = null;
     this.clients = new Map(); // clientId -> ws
     this.clients.set(hostId, hostWs);
     this.lastState = null; // { videoId, time, playing, updatedAt }
@@ -49,6 +64,13 @@ class Room {
       if (id === fromId) continue;
       if (ws.readyState === ws.OPEN) ws.send(msg);
     }
+  }
+  clearGrace() {
+    if (this.graceTimer) {
+      clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+    this.hostMissing = false;
   }
 }
 
@@ -85,11 +107,48 @@ wss.on('connection', (ws) => {
     switch (msg.type) {
       case 'create_room': {
         const code = makeRoomCode();
-        const room = new Room(code, ws.clientId, ws);
+        const hostToken = makeHostToken();
+        const room = new Room(code, ws.clientId, ws, hostToken);
         rooms.set(code, room);
         ws.roomCode = code;
         ws.isHost = true;
-        ws.send(JSON.stringify({ type: 'room_created', code, clientId: ws.clientId }));
+        ws.send(JSON.stringify({
+          type: 'room_created',
+          code,
+          clientId: ws.clientId,
+          hostToken
+        }));
+        break;
+      }
+
+      // A host whose socket dropped tries to resume the SAME room (same
+      // code) instead of spinning up a brand new one that guests don't
+      // know about.
+      case 'reclaim_host': {
+        const code = (msg.code || '').toUpperCase().trim();
+        const room = rooms.get(code);
+        if (!room || !msg.hostToken || room.hostToken !== msg.hostToken) {
+          ws.send(JSON.stringify({ type: 'reclaim_failed' }));
+          return;
+        }
+
+        // Drop the stale ws entry (old socket for the same host), attach fresh one.
+        room.clients.delete(room.hostId);
+        room.hostId = ws.clientId;
+        room.clients.set(ws.clientId, ws);
+        room.clearGrace();
+        room.touch();
+        ws.roomCode = code;
+        ws.isHost = true;
+
+        ws.send(JSON.stringify({
+          type: 'room_reclaimed',
+          code,
+          clientId: ws.clientId,
+          hostToken: room.hostToken,
+          memberCount: room.clients.size,
+          state: room.lastState
+        }));
         break;
       }
 
@@ -109,6 +168,7 @@ wss.on('connection', (ws) => {
           code,
           clientId: ws.clientId,
           memberCount: room.clients.size,
+          hostPaused: room.hostMissing, // let the guest UI show "waiting for host to reconnect"
           state: room.lastState // so the new viewer can jump to the current spot
         }));
         room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
@@ -117,7 +177,7 @@ wss.on('connection', (ws) => {
 
       case 'host_event': {
         const room = rooms.get(ws.roomCode);
-        if (!room || !ws.isHost) return; // only the host can drive sync
+        if (!room || !ws.isHost || room.hostId !== ws.clientId) return; // only the current host can drive sync
         room.touch();
         room.lastState = { ...msg.event, updatedAt: Date.now() };
         room.broadcast(ws.clientId, { type: 'sync', event: msg.event });
@@ -125,7 +185,7 @@ wss.on('connection', (ws) => {
       }
 
       case 'leave_room': {
-        cleanupClient(ws);
+        handleExplicitLeave(ws);
         break;
       }
 
@@ -138,20 +198,47 @@ wss.on('connection', (ws) => {
   ws.on('error', () => cleanupClient(ws));
 });
 
+// Intentional "Leave Room" click — close things immediately, no grace period.
+function handleExplicitLeave(ws) {
+  const room = rooms.get(ws.roomCode);
+  if (room) {
+    if (ws.isHost && room.hostId === ws.clientId) {
+      room.clearGrace();
+      room.broadcast(ws.clientId, { type: 'room_closed' });
+      rooms.delete(room.code);
+    } else {
+      room.clients.delete(ws.clientId);
+      room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
+    }
+  }
+  ws.roomCode = null;
+  ws.isHost = false;
+}
+
+// Socket just dropped (network blip, tab throttled, server restart, etc).
+// Guests: remove them, tell the room. Host: give it HOST_GRACE_MS to
+// reclaim the room before actually tearing it down.
 function cleanupClient(ws) {
   const room = rooms.get(ws.roomCode);
   if (!room) return;
 
-  room.clients.delete(ws.clientId);
-
-  if (ws.isHost) {
-    // Host left — tell everyone the party's over and drop the room.
-    room.broadcast(ws.clientId, { type: 'room_closed' });
-    rooms.delete(ws.roomCode);
-  } else if (room.clients.size > 0) {
-    room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
-  } else if (room.clients.size === 0 && !room.hostId) {
-    rooms.delete(ws.roomCode);
+  if (ws.isHost && room.hostId === ws.clientId) {
+    room.clients.delete(ws.clientId);
+    room.broadcast(ws.clientId, { type: 'host_disconnected' }); // let guests show "reconnecting…" instead of nothing
+    room.clearGrace(); // clear any stale timer before setting a new one
+    room.hostMissing = true;
+    room.graceTimer = setTimeout(() => {
+      const stillThere = rooms.get(room.code);
+      if (stillThere === room && room.hostMissing) {
+        room.broadcast(null, { type: 'room_closed' });
+        rooms.delete(room.code);
+      }
+    }, HOST_GRACE_MS);
+  } else {
+    room.clients.delete(ws.clientId);
+    if (room.clients.size > 0) {
+      room.broadcast(ws.clientId, { type: 'member_count', count: room.clients.size });
+    }
   }
   ws.roomCode = null;
 }
@@ -165,11 +252,14 @@ const heartbeat = setInterval(() => {
   });
 }, 30000);
 
-// Sweep abandoned rooms periodically (e.g. host's tab crashed without a close event).
+// Sweep abandoned rooms periodically (e.g. everyone's tabs are long gone).
 const sweeper = setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
-    if (now - room.lastUsed > ROOM_TTL_MS) rooms.delete(code);
+    if (now - room.lastUsed > ROOM_TTL_MS) {
+      room.clearGrace();
+      rooms.delete(code);
+    }
   }
 }, 15 * 60 * 1000);
 
